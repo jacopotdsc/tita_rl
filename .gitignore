@@ -15,3 +15,4 @@ envs/__pycache__/
 algorithm/__pycache__/
 __pycache__/
 **/__pycache__/
+test/test_results/
