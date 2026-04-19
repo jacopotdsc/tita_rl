@@ -27,10 +27,13 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
-from trajectory_generator import TrajectoryGenerator
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from trajectory_generator import TrajectoryGenerator
 
 def plot_generated_trajectory(
-    traj_gen : TrajectoryGenerator,
+    traj_gen: 'TrajectoryGenerator',
     vel_lin: float = 0.5, 
     vel_ang: float = 0.1, 
     vel_z: float = -0.05,
