@@ -5,8 +5,8 @@ import os
 import numpy as np
 from typing import List, Tuple
 from typing import NamedTuple, Optional, Tuple, Union
-from global_variables import _MPC_NX, _MPC_NU, _MPC_DT, _MPC_MASS, _MPC_GRAV, PLOT_DIR
-from global_variables import *
+from utils.global_variables import _MPC_NX, _MPC_NU, _MPC_DT, _MPC_MASS, _MPC_GRAV, PLOT_DIR
+from utils.global_variables import *
 
 class TrajectoryGenerator:
     

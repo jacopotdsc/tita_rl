@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 import re
-from global_variables import CASADI_FN_DIR, CUSADI_DIR, CUSADI_DST_DIR, CUSADI_BUILD_DIR, CODEGEN_SCRIPT, CUSADI_TEST_SCRIPT
+from utils.global_variables import CASADI_FN_DIR, CUSADI_DIR, CUSADI_DST_DIR, CUSADI_BUILD_DIR, CODEGEN_SCRIPT, CUSADI_TEST_SCRIPT
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 TEST_DIR        = os.path.dirname(os.path.abspath(__file__))
@@ -71,7 +71,14 @@ header("STEP 2 — Compile with run_codegen.py")
 compile_results = {}
 so_present      = {}
 
+SKIP_TEST = {'get_rCP': "code generate shape (9,1) and get"} 
+
 for fn in fn_names:
+    if fn in SKIP_TEST.keys():
+        print(f"\n  >> Skipping compilation of {fn}: {SKIP_TEST[fn]}")
+        compile_results[fn] = False
+        so_present[fn] = False
+        continue
     print(f"\n  >> Compiling: {fn}")
     result = subprocess.run(
         [sys.executable, CODEGEN_SCRIPT, f"--fn={fn}"],

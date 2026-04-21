@@ -49,7 +49,8 @@ def delete_files_in_directory(directory_path):
 def play_on_constraint_policy_runner(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # override some parameters for testing
-    env_cfg.env.num_envs = min(env_cfg.env.num_envs, 100)
+    env_cfg.env.num_envs = 16 #min(env_cfg.env.num_envs, 100)
+    print(f"------\n[INFO] Running with num_envs = {env_cfg.env.num_envs}\n------")
     env_cfg.terrain.num_rows = 5
     env_cfg.terrain.num_cols = 5
     env_cfg.terrain.curriculum = False

@@ -3,6 +3,7 @@ import mujoco.viewer
 import time
 import numpy as np
 import casadi as ca
+from utils.utils_general import export_functions
 
 def build_mpc(N=50, dt=0.002, mass=27.68978, g=9.81,
               Q_pos=None, R_ctrl=None):
@@ -56,7 +57,7 @@ def build_mpc(N=50, dt=0.002, mass=27.68978, g=9.81,
         omega_next
     )
  
-    f_dynamics = ca.Function('f_dynamics',
+    f_dynamics = ca.Function('mpc_f_dynamics',
                              [x_sym, u_sym], [x_next],
                              ['x', 'u'], ['x_next'])
  
@@ -99,7 +100,7 @@ def build_mpc(N=50, dt=0.002, mass=27.68978, g=9.81,
 
     g_neg_ineq = ca.vertcat()
  
-    f_constraints = ca.Function('f_constraints',
+    f_constraints = ca.Function('mpc_f_constraints',
                                 [x_sym, u_sym], [h_eq, g_soft, g_pos_ineq, g_neg_ineq],
                                 ['x', 'u'], ['h_eq', 'g_soft', 'g_pos_ineq', 'g_neg_ineq'])
  
@@ -226,7 +227,7 @@ def build_mpc(N=50, dt=0.002, mass=27.68978, g=9.81,
         X_cols.append(xk_r)
     X_full = ca.horzcat(*X_cols)               # (13, N+1)
  
-    f_rollout = ca.Function('f_rollout',
+    f_rollout = ca.Function('mpc_f_rollout',
                             [x0_r, U_flat_r], [X_full],
                             ['x0', 'U'], ['X'])
  
@@ -289,17 +290,6 @@ def solve_mpc(mpc, x0_val, xref_val, U_warm=None):
  
     return U_opt, X_opt
  
-def export_functions(mpc, out_dir='./casadi_functions'):
-    
-    import os
-    os.makedirs(out_dir, exist_ok=True)
- 
-    for name in ['f_dynamics', 'f_constraints', 'f_rollout']:
-        fn   = mpc[name]
-        path = os.path.join(out_dir, f'{name}.casadi')
-        fn.save(path)
-        print(f"Saved: {path}  (n_instructions: {fn.n_instructions()})")
-
 if __name__ == "__main__":
     a_weight     = 1
     acz_weight   = 0.01
@@ -310,4 +300,8 @@ if __name__ == "__main__":
     R_ctrl = np.diag([a_weight, acz_weight, alpha_weight, fx_weight, fy_weight, fz_weight, fx_weight, fy_weight, fz_weight])
     Q_pos = np.diag([1, 1, 1])
     mpc = build_mpc(Q_pos=Q_pos, R_ctrl=R_ctrl)
-    export_functions(mpc)
+    
+    export_functions(mpc['f_dynamics'])
+    export_functions(mpc['f_constraints'])
+    export_functions(mpc['f_rollout'])
+    

@@ -5,7 +5,7 @@ import torch
 from typing import TYPE_CHECKING
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-TEST_DIR        = os.path.dirname(os.path.abspath(__file__))
+TEST_DIR        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..") 
 PLOT_DIR        = os.path.join(TEST_DIR, "test_results")
 
 # MuJoCo model

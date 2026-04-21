@@ -1,156 +1,15 @@
-import mujoco
-import mujoco.viewer
-import time
+import os
 import numpy as np
-import casadi as ca
-import pinocchio as pin
 import matplotlib.pyplot as plt
-from typing import TYPE_CHECKING
-from global_variables import _MPC_DT
+from .global_variables import _MPC_DT, CASADI_FN_DIR
 
-if TYPE_CHECKING:
-    from trajectory_generator import TrajectoryGenerator
-
-
-def get_rCP(R_wheel, radius):
-    z0 = ca.vertcat(0, 0, 1)
-    n  = ca.mtimes(R_wheel, z0)
-    I3 = ca.SX.eye(3)
-    a  = ca.mtimes(I3 - ca.mtimes(n, n.T), z0)
-    s  = a / (ca.norm_2(a) + 1e-9)
-    return -s * radius
-
-def get_rCP_np(R_wheel, radius):
-    z0 = np.array([0.0, 0.0, 1.0], dtype=float)
-    n = R_wheel @ z0
-    a = (np.eye(3) - np.outer(n, n)) @ z0
-    s = a / (np.linalg.norm(a) + 1e-9)
-    return -s * radius
-
-def get_tita_state( model, data, torso_body_id, 
-                    left_wheel_site_id, right_wheel_site_id, 
-                    wheel_radius=0.0925):
-
-    # ── COM ──
-    mujoco.mj_comPos(model, data)    # aggiorna subtree_com se serve
-    pcom = data.subtree_com[torso_body_id].copy()          # (3,)
-    vcom = data.cvel[torso_body_id, 3:6].copy()            # (3,)
-
-    # ── Wheel positions + rotations ──
-    l_wheel_center = data.site_xpos[left_wheel_site_id].copy()     # (3,)
-    r_wheel_center = data.site_xpos[right_wheel_site_id].copy()    # (3,)
-    l_wheel_R = data.site_xmat[left_wheel_site_id].reshape(3, 3)  # (3,3)
-    r_wheel_R = data.site_xmat[right_wheel_site_id].reshape(3, 3) # (3,3)
-
-    # ── Contact points ──
-    left_rCP  = get_rCP_np(l_wheel_R, wheel_radius)
-    right_rCP = get_rCP_np(r_wheel_R, wheel_radius)
-    left_contact  = l_wheel_center + left_rCP
-    right_contact = r_wheel_center + right_rCP
-
-    # ── Wheel velocities via Jacobian ──
-    jacp_l = np.zeros((3, model.nv))
-    jacp_r = np.zeros((3, model.nv))
-    mujoco.mj_jacSite(model, data, jacp_l, None, left_wheel_site_id)
-    mujoco.mj_jacSite(model, data, jacp_r, None, right_wheel_site_id)
-    dpl_world = jacp_l @ data.qvel    # (3,)
-    dpr_world = jacp_r @ data.qvel    # (3,)
-
-    # ── Pack ──
-    x_IN = np.concatenate([
-        pcom,            # [0:3]   p_CoM
-        vcom,            # [3:6]   v_CoM
-        left_contact,    # [6:9]   left contact point
-        right_contact,   # [9:12]  right contact point
-        dpl_world,       # [12:15] left wheel velocity
-        dpr_world,       # [15:18] right wheel velocity
-    ])
-    return x_IN
-
-def get_tita_state_pin(mj_data, pin_model, pin_data,
-                   left_leg4_idx, right_leg4_idx,
-                   wheel_radius=0.0925):
-
-    q    = mj_data.qpos.copy()
-    qdot = mj_data.qvel.copy()
-
-    # ── COM ──
-    pin.centerOfMass(pin_model, pin_data, q, qdot)
-    pcom = pin_data.com[0].copy()
-    vcom = pin_data.vcom[0].copy()
-
-    # ── FK ──
-    pin.framesForwardKinematics(pin_model, pin_data, q)
-    pin.computeJointJacobians(pin_model, pin_data, q)
-
-    l_SE3 = pin_data.oMf[left_leg4_idx]
-    r_SE3 = pin_data.oMf[right_leg4_idx]
-
-    left_contact  = l_SE3.translation + get_rCP_np(l_SE3.rotation, wheel_radius)
-    right_contact = r_SE3.translation + get_rCP_np(r_SE3.rotation, wheel_radius)
-
-    # ── Jacobians ──
-    J_left  = pin.getFrameJacobian(pin_model, pin_data, left_leg4_idx,
-                                pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
-    J_right = pin.getFrameJacobian(pin_model, pin_data, right_leg4_idx,
-                                    pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
-
-    dpl_world = J_left[:3,  :] @ qdot
-    dpr_world = J_right[:3, :] @ qdot
-
-    return np.concatenate([pcom, vcom, left_contact, right_contact,
-                           dpl_world, dpr_world])
-
-def compute_desired_joint_acc(q_pos, q_vel, q_pos_target, kp=80.0, kd=8.0):
-    """PD in joint space → desired q_ddot to feed into WBC."""
-    err   = q_pos_target - q_pos
-    err   = np.arctan2(np.sin(err), np.cos(err))  # wrap
-    return kp * err - kd * q_vel
-
-def unwrapNear(theta_wrapped: float, theta_prev: float) -> float:
-    # wrapping to pi
-    a = theta_wrapped - theta_prev 
-
-    a = (a + np.pi) % (2 * np.pi)
-    a = np.where(a < 0, a + 2*np.pi, a)
-    a = a - np.pi
-
-    return theta_prev + a
-
-def get_dfip_state(tita_state, theta_prev, com_feet_distance = 0.5706):
-
-    pcom = tita_state[0:3]
-    vcom = tita_state[3:6]
-    pl_world = tita_state[6:9]
-    pr_world = tita_state[9:12]
-    dpl_world = tita_state[12:15]
-    dpr_world = tita_state[15:18]
-
-    c_world = (pl_world + pr_world) / 2.0
-    vc_world = (dpl_world + dpr_world) / 2.0
-
-    diff = pl_world - pr_world
-    theta_wrapped = np.arctan2(-diff[0], diff[1])
-    theta = unwrapNear(theta_wrapped, theta_prev)
-
-    R = np.array([
-        [ np.cos(theta), -np.sin(theta), 0.],
-        [ np.sin(theta),  np.cos(theta), 0.],
-        [ 0.,              0.,             1.]
-    ])
-
-    dpl_body = R.T @ dpl_world
-    dpr_body = R.T @ dpr_world
-
-    w = (dpr_body[0] - dpl_body[0]) / com_feet_distance
-    v = (dpl_body[0] + dpr_body[0]) / 2.0
-
-    return np.concatenate([
-        pcom,
-        vcom,
-        c_world,
-        np.array([vc_world[2], theta, v, w], dtype=float),
-    ]).astype(float)
+def export_functions(fn):
+    
+    fn_name = fn.name() 
+    os.makedirs(CASADI_FN_DIR, exist_ok=True)
+    path = os.path.join(CASADI_FN_DIR, f'{fn_name}.casadi')
+    fn.save(path)
+    print(f"Saved: {path}  (n_instructions: {fn.n_instructions()})")
 
 def plot_mpc_horizon(X_opt, U_opt, dt=0.002):
 
@@ -245,38 +104,6 @@ def plot_mpc_horizon(X_opt, U_opt, dt=0.002):
     plt.tight_layout()
     #plt.show()
 
-def mpc_sol_to_wbc_input(x_curr, u_curr, des, mass=27.68978, g=9.81, wheel_radius=0.0925, com_feet_distance=0.5706):
-
-    v_com_curr = x_curr[3:6]
-    c = x_curr[6:9]
-    theta = x_curr[10]
-    acc_com = u_curr[0:3]
-
-    Rz = np.array([[ np.cos(theta), -np.sin(theta), 0],
-                    [ np.sin(theta),  np.cos(theta), 0],
-                    [ 0,              0,             1]])
-    offset = Rz @ np.array([0, com_feet_distance / 2, 0])
-    left_contact  = c + offset
-    right_contact = c - offset
-
-    des.lwheel.pos = np.eye(4)
-    des.lwheel.pos[0:3, 3] = left_contact
-    des.lwheel.pos[2, 3]  += wheel_radius
-    des.lwheel.vel = np.zeros(6)
-    des.lwheel.vel[0:3] = v_com_curr
-    des.lwheel.acc = np.zeros(6)
-    des.lwheel.acc[0:3] = acc_com
-
-    des.rwheel.pos = np.eye(4)
-    des.rwheel.pos[0:3, 3] = right_contact
-    des.rwheel.pos[2, 3]  += wheel_radius
-    des.rwheel.vel = np.zeros(6)
-    des.rwheel.vel[0:3] = v_com_curr
-    des.rwheel.acc = np.zeros(6)
-    des.rwheel.acc[0:3] = acc_com
-
-    return des
-
 def plot_generated_trajectory(
     traj_gen: 'TrajectoryGenerator',
     vel_lin: float = 0.5, 
@@ -368,4 +195,4 @@ def plot_generated_trajectory(
     os.makedirs(dest_dir, exist_ok=True)
     plt.savefig(os.path.join(dest_dir, f'{name_fig}.png'), dpi=300)
     
-    
+ 

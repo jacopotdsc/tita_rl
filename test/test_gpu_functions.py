@@ -12,7 +12,7 @@ import time
 import numpy as np
 import torch
 import casadi as ca
-from global_variables import PLOT_DIR, _MPC_NX, _MPC_NU, _MPC_HORIZON, _MPC_DT, _MPC_MASS, _MPC_GRAV
+from utils.global_variables import PLOT_DIR, _MPC_NX, _MPC_NU, _MPC_HORIZON, _MPC_DT, _MPC_MASS, _MPC_GRAV
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 TEST_DIR         = os.path.dirname(os.path.abspath(__file__))
