@@ -1,9 +1,284 @@
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'cusadi'))
+
 import mujoco
 import mujoco.viewer
 import time
 import numpy as np
 import casadi as ca
 from utils.utils_general import export_functions
+
+def build_ilqr_cost(f_dynamics, l_stage, l_term, nx, nu, N, dt):
+    """
+    Compila una singola iterazione iLQR come ca.Function (compilabile con CusADi).
+
+    Parametri
+    ---------
+    f_dynamics : ca.Function (x[nx], u[nu]) -> x_next[nx]
+    l_stage    : ca.Function (x[nx], u[nu], xref_k[3]) -> scalar
+    l_term     : ca.Function (x[nx], xref_N[3])        -> scalar
+    nx, nu, N  : dimensioni stato, controllo, orizzonte
+    dt         : timestep (non usato direttamente, serve per documentazione)
+
+    Input della funzione compilata
+    ------------------------------
+    x0    : (nx,)      stato iniziale
+    U     : (nu, N)    traiettoria controlli iniziale (warm start)
+    xref  : (3, N+1)   riferimento posizione CoM
+
+    Output
+    ------
+    U_new : (nu, N)    traiettoria controlli aggiornata
+    """
+
+    # ── simboli input della funzione finale ──
+    x0_sym   = ca.SX.sym('x0',   nx)
+    U_sym    = ca.SX.sym('U',    nu, N)
+    xref_sym = ca.SX.sym('xref', 3,  N + 1)
+
+    # ── simboli per calcolo gradienti costo ──
+    x_s    = ca.SX.sym('x',      nx)
+    u_s    = ca.SX.sym('u',      nu)
+    xref_s = ca.SX.sym('xref_k', 3)
+
+    # gradienti del costo stage calcolati simbolicamente una volta sola
+    l_val = l_stage(x_s, u_s, xref_s)
+    lx    = ca.jacobian(l_val, x_s).T   # (nx, 1)
+    lu    = ca.jacobian(l_val, u_s).T   # (nu, 1)
+    lxx   = ca.jacobian(lx,   x_s)     # (nx, nx)
+    luu   = ca.jacobian(lu,   u_s)     # (nu, nu)
+    lux   = ca.jacobian(lu,   x_s)     # (nu, nx)
+
+    # gradienti del costo terminale
+    lf_val = l_term(x_s, xref_s)
+    lfx    = ca.jacobian(lf_val, x_s).T  # (nx, 1)
+    lfxx   = ca.jacobian(lfx,   x_s)    # (nx, nx)
+
+    # ════════════════════════════════════════════════
+    # 1. FORWARD ROLLOUT
+    #    dato (x0, U) calcola la traiettoria nominale X_nom
+    # ════════════════════════════════════════════════
+    X_nom = [x0_sym]
+    xk = x0_sym
+    for k in range(N):
+        xk = f_dynamics(xk, U_sym[:, k])
+        X_nom.append(xk)
+
+    # ════════════════════════════════════════════════
+    # 2. BACKWARD PASS
+    #    calcola i guadagni k_ff (nu,) e K_fb (nu, nx)
+    # ════════════════════════════════════════════════
+
+    # value function terminale
+    xu_xref_N = ca.vertcat(x_s, xref_s)
+    xu_xref_N_nom = ca.vertcat(X_nom[N], xref_sym[:, N])
+    Vx  = ca.substitute(lfx,  xu_xref_N, xu_xref_N_nom)
+    Vxx = ca.substitute(lfxx, xu_xref_N, xu_xref_N_nom)
+
+    k_ff_list = []
+    K_fb_list = []
+
+    # simboli freschi per la linearizzazione della dinamica
+    x_lin = ca.SX.sym('x_lin', nx)
+    u_lin = ca.SX.sym('u_lin', nu)
+    f_eval = f_dynamics(x_lin, u_lin)
+    A_sym  = ca.jacobian(f_eval, x_lin)  # (nx, nx) — calcolato una volta
+    B_sym  = ca.jacobian(f_eval, u_lin)  # (nx, nu) — calcolato una volta
+
+    for k in range(N - 1, -1, -1):
+        xk_nom = X_nom[k]
+        uk_nom = U_sym[:, k]
+        xref_k = xref_sym[:, k]
+
+        # linearizza dinamiche attorno al punto nominale
+        xu_nom = ca.vertcat(xk_nom, uk_nom)
+        A = ca.substitute(A_sym, ca.vertcat(x_lin, u_lin), xu_nom)
+        B = ca.substitute(B_sym, ca.vertcat(x_lin, u_lin), xu_nom)
+
+        # gradienti costo stage al punto nominale
+        xu_xref = ca.vertcat(x_s, u_s, xref_s)
+        xu_xref_nom = ca.vertcat(xk_nom, uk_nom, xref_k)
+        lx_k  = ca.substitute(lx,  xu_xref, xu_xref_nom)
+        lu_k  = ca.substitute(lu,  xu_xref, xu_xref_nom)
+        lxx_k = ca.substitute(lxx, xu_xref, xu_xref_nom)
+        luu_k = ca.substitute(luu, xu_xref, xu_xref_nom)
+        lux_k = ca.substitute(lux, xu_xref, xu_xref_nom)
+
+        # Q-function gradients
+        Qx  = lx_k  + ca.mtimes(A.T, Vx)
+        Qu  = lu_k  + ca.mtimes(B.T, Vx)
+        Qxx = lxx_k + ca.mtimes([A.T, Vxx, A])
+        Quu = luu_k + ca.mtimes([B.T, Vxx, B])
+        Qux = lux_k + ca.mtimes([B.T, Vxx, A])
+
+        # guadagni ottimi
+        Quu_inv = ca.inv(Quu)
+        k_ff = -ca.mtimes(Quu_inv, Qu)    # (nu,)
+        K_fb = -ca.mtimes(Quu_inv, Qux)   # (nu, nx)
+
+        k_ff_list.insert(0, k_ff)
+        K_fb_list.insert(0, K_fb)
+
+        # aggiorna value function (equazioni di Riccati)
+        Vx  = Qx  + ca.mtimes(K_fb.T, ca.mtimes(Quu, k_ff)) \
+                  + ca.mtimes(K_fb.T, Qu) \
+                  + ca.mtimes(Qux.T, k_ff)
+        Vxx = Qxx + ca.mtimes(K_fb.T, ca.mtimes(Quu, K_fb)) \
+                  + ca.mtimes(K_fb.T, Qux) \
+                  + ca.mtimes(Qux.T, K_fb)
+
+    # ════════════════════════════════════════════════
+    # 3. FORWARD PASS
+    #    aggiorna U con i guadagni calcolati
+    # ════════════════════════════════════════════════
+    U_new_cols = []
+    xk = x0_sym
+    for k in range(N):
+        dx     = xk - X_nom[k]
+        uk_new = U_sym[:, k] + k_ff_list[k] + ca.mtimes(K_fb_list[k], dx)
+        U_new_cols.append(uk_new)
+        xk = f_dynamics(xk, uk_new)
+
+    U_new = ca.horzcat(*U_new_cols)  # (nu, N)
+
+    # ════════════════════════════════════════════════
+    # 4. Compila come ca.Function
+    # ════════════════════════════════════════════════
+    f_ilqr = ca.Function(
+        'mpc_f_ilqr',
+        [x0_sym, U_sym, xref_sym],
+        [U_new],
+        ['x0', 'U', 'xref'],
+        ['U_new'],
+        {'cse': True, 'post_expand': True},
+    )
+
+    return f_ilqr
+
+def build_ilqr(f_dynamics, nx, nu, N, dt,                                           
+
+
+               Q, R, Qf,
+               n_ilqr_iter=3):
+    """
+    f_dynamics : ca.Function (x, u) -> x_next  (già hai questa)
+    nx, nu, N  : dimensioni
+    Q, R, Qf   : np.ndarray pesi costo
+    n_ilqr_iter: numero iterazioni iLQR (come NQP nel paper)
+    """
+    n = Q.shape[0]
+    Q_full = np.zeros((nx, nx))
+    Q_full[:n, :n] = Q
+
+    Q  = ca.DM(Q_full)
+    R  = ca.DM(R)
+    Qf = ca.DM(Qf)
+
+    # ── simboli input ──
+    x0_sym  = ca.SX.sym('x0',  nx)
+    U_sym   = ca.SX.sym('U',   nu, N)   # traiettoria controlli iniziale
+    xref_sym = ca.SX.sym('xref', 3, N+1)  # traiettoria riferimento
+    mass = 27.68978
+    g = 9.81
+    ref_u = ca.DM([0, 0, 0, 0, 0, mass*g/2, 0, 0, mass*g/2])
+
+    # ════════════════════════════════════════════════
+    # 1. FORWARD ROLLOUT
+    #    dato x0 e U, calcola X nominale
+    # ════════════════════════════════════════════════
+    X_nom = [x0_sym]
+    xk = x0_sym
+    for k in range(N):
+        uk = U_sym[:, k]
+        xk = f_dynamics(xk, uk)
+        X_nom.append(xk)
+    # X_nom è lista di N+1 vettori SX
+
+    # ════════════════════════════════════════════════
+    # 2. BACKWARD PASS
+    #    linearizza le dinamiche attorno a (X_nom, U)
+    #    calcola i guadagni k_ff e K_fb
+    # ════════════════════════════════════════════════
+
+    # terminal value function
+    eN = X_nom[N][0:3] - xref_sym[:, N]
+    Vx_pos = 2 * ca.mtimes(Qf, eN)               # (3,)
+    Vx  = ca.vertcat(Vx_pos, ca.SX.zeros(nx-3))  # (13,)
+    Vxx_small = 2 * Qf                            # (3,3)
+    Vxx = ca.blockcat([[Vxx_small,              ca.SX.zeros(3,  nx-3)],
+                    [ca.SX.zeros(nx-3, 3),  ca.SX.zeros(nx-3, nx-3)]])  # (13,13)
+
+    k_ff_list = []   # feedforward gains  (nu,)   per ogni step
+    K_fb_list = []   # feedback gains     (nu, nx) per ogni step
+
+    for k in range(N-1, -1, -1):
+        xk_nom = X_nom[k]
+        uk_nom = U_sym[:, k]
+        ek_pos  = xk_nom[0:3] - xref_sym[:, k]
+        ek_full = ca.vertcat(ek_pos, ca.SX.zeros(nx-3))
+
+        # linearizza dinamiche: A = df/dx, B = df/du
+        x_lin = ca.SX.sym('x_lin', nx)
+        u_lin = ca.SX.sym('u_lin', nu)
+        f_eval = f_dynamics(x_lin, u_lin)
+        A = ca.substitute(ca.jacobian(f_eval, x_lin), ca.vertcat(x_lin, u_lin), ca.vertcat(xk_nom, uk_nom))
+        B = ca.substitute(ca.jacobian(f_eval, u_lin), ca.vertcat(x_lin, u_lin), ca.vertcat(xk_nom, uk_nom))
+
+        # expanded Q-function gradients
+        Qx  = 2*ca.mtimes(Q, ek_full)          + ca.mtimes(A.T, Vx)
+        
+        Qu  = 2*ca.mtimes(R, uk_nom - ref_u) + ca.mtimes(B.T, Vx)
+        Qxx = 2*Q                          + ca.mtimes([A.T, Vxx, A])
+        Quu = 2*R                          + ca.mtimes([B.T, Vxx, B])
+        Qux =                                ca.mtimes([B.T, Vxx, A])
+
+        # gains
+        Quu_inv = ca.inv(Quu)             # (nu, nu) — piccolo, ok
+        k_ff = -ca.mtimes(Quu_inv, Qu)   # (nu,)
+        K_fb = -ca.mtimes(Quu_inv, Qux)  # (nu, nx)
+
+        k_ff_list.insert(0, k_ff)
+        K_fb_list.insert(0, K_fb)
+
+        # aggiorna value function
+        Vx  = Qx  + ca.mtimes(K_fb.T, ca.mtimes(Quu, k_ff)) \
+                  + ca.mtimes(K_fb.T, Qu) \
+                  + ca.mtimes(Qux.T, k_ff)
+        Vxx = Qxx + ca.mtimes(K_fb.T, ca.mtimes(Quu, K_fb)) \
+                  + ca.mtimes(K_fb.T, Qux) \
+                  + ca.mtimes(Qux.T, K_fb)
+
+    # ════════════════════════════════════════════════
+    # 3. FORWARD PASS
+    #    aggiorna U con i guadagni calcolati
+    # ════════════════════════════════════════════════
+    alpha = 1.0   # line search fissa come nel paper
+    U_new_cols = []
+    xk = x0_sym
+    for k in range(N):
+        uk_nom  = U_sym[:, k]
+        k_ff_k  = k_ff_list[k]
+        K_fb_k  = K_fb_list[k]
+
+        dx = xk - X_nom[k]   # deviazione dallo stato nominale
+        uk_new = uk_nom + alpha * k_ff_k + ca.mtimes(K_fb_k, dx)
+        U_new_cols.append(uk_new)
+
+        xk = f_dynamics(xk, uk_new)
+
+    U_new = ca.horzcat(*U_new_cols)   # (nu, N)
+
+    # ════════════════════════════════════════════════
+    # 4. compila la funzione  →  compilabile CusADi
+    # ════════════════════════════════════════════════
+    f_ilqr = ca.Function('mpc_f_ilqr_base',
+        [x0_sym, U_sym, xref_sym],
+        [U_new],
+        ['x0', 'U', 'xref'],
+        ['U_new']
+    )
+
+    return f_ilqr
 
 def build_mpc(N=50, dt=0.002, mass=27.68978, g=9.81,
               Q_pos=None, R_ctrl=None):
@@ -299,8 +574,89 @@ if __name__ == "__main__":
     fz_weight    = 0.0001
     R_ctrl = np.diag([a_weight, acz_weight, alpha_weight, fx_weight, fy_weight, fz_weight, fx_weight, fy_weight, fz_weight])
     Q_pos = np.diag([1, 1, 1])
+
     mpc = build_mpc(Q_pos=Q_pos, R_ctrl=R_ctrl)
+    ilqr = build_ilqr(mpc['f_dynamics'], nx=13, nu=9, N=50, dt=0.002, Q=Q_pos, R=R_ctrl, Qf=Q_pos*5)
     
+    x0_test   = np.zeros(13)
+    x0_test[2] = 0.5  # altezza com
+    U_test    = np.zeros((9, 50))
+    xref_test = np.zeros((3, 51))
+    xref_test[2, :] = 0.4  # riferimento a 0.4m di altezza
+
+    U_new = np.array(ilqr(x0_test, U_test, xref_test))
+    print("iLQR output shape:", U_new.shape)  # atteso (9, 50)
+    print("iLQR primo controllo:", U_new[:, 0])
+    
+    x_s  = ca.SX.sym('x', 13)
+    u_s  = ca.SX.sym('u', 9)
+    xr_s = ca.SX.sym('xref_k', 3)
+
+    mass = 27.68978
+    g = 9.81
+    ref_u = ca.vertcat(
+        0,                  # a
+        0,                  # a_cz
+        0,                  # alpha
+        0,                  # fl_x
+        0,                  # fl_y
+        mass * g / 2.0,     # fl_z
+        0,                  # fr_x
+        0,                  # fr_y
+        mass * g / 2.0,     # fr_z
+    )
+
+    e_pos     = x_s[0:3] - xr_s
+    e_ctrl    = u_s - ref_u   # ref_u con forze gravità come in solve_mpc
+    Q_ca      = ca.DM(Q_pos)
+    R_ca      = ca.DM(R_ctrl)
+
+    h_eq, g_soft, g_pos, _ = mpc['f_constraints'](x_s, u_s)
+    fl_z = u_s[5]
+    fr_z = u_s[8]
+    w_eq   = 1
+    w_soft = 1
+    w_ineq = 1
+    l_cstr = ca.Function('l_cstr', [x_s, u_s, xr_s],
+        [w_eq   * ca.dot(h_eq,   h_eq)            # momento = 0
+    + w_soft * ca.dot(g_soft, g_soft)         # cx≈px, cy≈py
+    + w_ineq * (fl_z - ref_u[5]) ** 2          # fl_z >= 0
+    + w_ineq * (fr_z - ref_u[8]) ** 2]) 
+
+    l_traj = ca.Function('l_traj', [x_s, u_s, xr_s],
+            [ca.mtimes([e_pos.T, Q_ca, e_pos]) +
+            ca.mtimes([e_ctrl.T, R_ca, e_ctrl])])
+
+    l_cstr = ca.Function('l_cstr', [x_s, u_s, xr_s],
+        [
+        #w_eq   * ca.dot(h_eq,   h_eq)            # momento = 0
+        #+ w_soft * ca.dot(g_soft, g_soft)           # cx≈px, cy≈py
+        + w_ineq * (fl_z - ref_u[5]) ** 2          # fl_z >= 0
+        + w_ineq * (fr_z - ref_u[8]) ** 2
+        ])        # fr_z >= 0
+
+    # ── stage totale ──
+    l_stage = ca.Function('l_stage', [x_s, u_s, xr_s],
+        [l_traj(x_s, u_s, xr_s) + l_cstr(x_s, u_s, xr_s)])
+
+    l_term  = ca.Function('l_term',  [x_s, xr_s],
+                        [5 * ca.mtimes([e_pos.T, Q_ca, e_pos])])
+
+    ilqr = build_ilqr_cost(mpc['f_dynamics'], l_stage, l_term, nx=13, nu=9, N=50, dt=0.002)
+    nx = 13
+    nu = 9
+    N = 50
+ 
+    U_new_2 = np.array(ilqr(x0_test, U_test, xref_test))
+    print(f"U_ilqr_cost: {U_new_2[:, 0]}")  # stampa primo controllo per verifica
+
+    diff_sol = U_new[:, 0] - U_new_2[:, 0]
+    diff_norm = np.linalg.norm(diff_sol)
+    print(f"diff solutions: {diff_norm} -> {diff_sol}")  # dovrebbe essere diverso da zero se il costo influenza la soluzione
+
+    ##############
+
+    export_functions(ilqr)
     export_functions(mpc['f_dynamics'])
     export_functions(mpc['f_constraints'])
     export_functions(mpc['f_rollout'])
